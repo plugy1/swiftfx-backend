@@ -1283,7 +1283,7 @@ app.get("/test-clickpesa-token", async (req, res) => {
 
 app.get("/test-stk", async (req, res) => {
   try {
-    const phoneNumber = "0770204679";
+    const phoneNumber = "255770204679";
     const amount = "1000";
     const orderReference = `TEST-${Date.now()}`;
 
