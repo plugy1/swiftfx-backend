@@ -844,7 +844,7 @@ app.post(
          ----------------------------------------------------- */
 
       const orderReference =
-        `SWIFTTEST${Date.now()}`;
+  `SW${Date.now().toString().slice(-12)}`;
 
       /* -----------------------------------------------------
          4. CREATE CLICKPESA PREVIEW REQUEST
