@@ -2213,8 +2213,3 @@ app.listen(PORT, () => {
     `ClickPesa API: ${CLICKPESA_BASE_URL}`
   );
 });
-'''
-
-out = Path("/mnt/data/server_corrected.js")
-out.write_text(code, encoding="utf-8")
-print(f"Created {out} ({out.stat().st_size} bytes, {len(code.splitlines())} lines)")
