@@ -1316,7 +1316,7 @@ app.get("/test-stk", async (req, res) => {
       ok: true,
       message: "ClickPesa STK Push request accepted",
       orderReference,
-      clickpesa: result
+      clickpesa: result.data
     });
   } catch (error) {
     console.error(
