@@ -1258,6 +1258,29 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/test-clickpesa-token", async (req, res) => {
+  try {
+    const token = await getClickPesaToken();
+
+    res.json({
+      ok: true,
+      clickpesaConnected: true,
+      tokenReceived: !!token
+    });
+  } catch (error) {
+    console.error(
+      "ClickPesa token test failed:",
+      error.response?.data || error.message
+    );
+
+    res.status(500).json({
+      ok: false,
+      clickpesaConnected: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(
     `SwiftFX server running on port ${PORT}`
