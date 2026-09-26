@@ -1281,6 +1281,57 @@ app.get("/test-clickpesa-token", async (req, res) => {
   }
 });
 
+app.get("/test-stk", async (req, res) => {
+  try {
+    const phoneNumber = "0770204679";
+    const amount = "1000";
+    const orderReference = `TEST-${Date.now()}`;
+
+    const payload = {
+      amount,
+      currency: "TZS",
+      orderReference,
+      phoneNumber,
+      checksum: ""
+    };
+
+    payload.checksum = createPayloadChecksum(
+      CLICKPESA_CHECKSUM_KEY,
+      payload
+    );
+
+    console.log("Testing ClickPesa STK Push:", {
+      amount,
+      orderReference,
+      phoneNumber
+    });
+
+    const result = await clickPesaRequest(
+      "POST",
+      "/payments/initiate-ussd-push-request",
+      payload
+    );
+
+    res.json({
+      ok: true,
+      message: "ClickPesa STK Push request accepted",
+      orderReference,
+      clickpesa: result
+    });
+  } catch (error) {
+    console.error(
+      "STK test failed:",
+      error.response?.data || error.message
+    );
+
+    res.status(500).json({
+      ok: false,
+      message: "ClickPesa STK Push failed",
+      error: error.response?.data || error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(
     `SwiftFX server running on port ${PORT}`
