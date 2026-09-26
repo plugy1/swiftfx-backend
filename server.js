@@ -1251,6 +1251,12 @@ app.use(
 /* =========================================================
    START SERVER
    ========================================================= */
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    message: "SwiftFX backend is running"
+  });
+});
 
 app.listen(PORT, () => {
   console.log(
