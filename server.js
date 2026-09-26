@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const crypto = require("crypto");
