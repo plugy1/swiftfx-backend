@@ -763,6 +763,218 @@ app.post(
 );
 
 /* =========================================================
+   TEMP TEST — CREATE USER + SEND STK PUSH
+   REMOVE THIS ENDPOINT AFTER TESTING
+   ========================================================= */
+
+app.post(
+  "/api/test/create-user-and-stk",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const {
+        phone_number,
+        amount,
+        mobile_network = "Vodacom",
+      } = req.body || {};
+
+      if (!phone_number) {
+        return res.status(400).json({
+          success: false,
+          message: "Phone number is required.",
+        });
+      }
+
+      if (!amount || Number(amount) <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "A valid amount is required.",
+        });
+      }
+
+      /* -----------------------------------------------------
+         1. CLEAN PHONE NUMBER
+         ----------------------------------------------------- */
+
+      const cleanedPhone = cleanPhoneNumber(phone_number);
+
+      if (!cleanedPhone.startsWith("255")) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid Tanzania phone number.",
+        });
+      }
+
+      /* -----------------------------------------------------
+         2. CREATE A SUPABASE AUTH USER
+         ----------------------------------------------------- */
+
+      const testEmail =
+        `test_${Date.now()}@swiftfx.test`;
+
+      const testPassword =
+        `SwiftFXTest_${Date.now()}!`;
+
+      const {
+        data: authData,
+        error: authError,
+      } = await supabase.auth.admin.createUser({
+        email: testEmail,
+        password: testPassword,
+        email_confirm: true,
+      });
+
+      if (authError) {
+        console.error(
+          "Test Supabase user creation failed:",
+          authError.message
+        );
+
+        return res.status(500).json({
+          success: false,
+          message: "Could not create Supabase user.",
+          error: authError.message,
+        });
+      }
+
+      const userId = authData.user.id;
+
+      /* -----------------------------------------------------
+         3. GENERATE CLICKPESA-SAFE ORDER REFERENCE
+         ----------------------------------------------------- */
+
+      const orderReference =
+        `SWIFTTEST${Date.now()}`;
+
+      /* -----------------------------------------------------
+         4. CREATE CLICKPESA PREVIEW REQUEST
+         ----------------------------------------------------- */
+
+      const previewPayload = {
+        amount: String(Math.round(Number(amount))),
+        currency: "TZS",
+        orderReference,
+        phoneNumber: cleanedPhone,
+        fetchSenderDetails: false,
+      };
+
+      previewPayload.checksum =
+        createPayloadChecksum(
+          CLICKPESA_CHECKSUM_KEY,
+          previewPayload
+        );
+
+      let previewResponse;
+
+      try {
+        previewResponse =
+          await clickPesaRequest(
+            "POST",
+            "/payments/preview-ussd-push-request",
+            previewPayload
+          );
+      } catch (error) {
+        console.error(
+          "ClickPesa test preview failed:",
+          error.response?.data || error.message
+        );
+
+        return res.status(502).json({
+          success: false,
+          message: "ClickPesa preview failed.",
+          userId,
+          testEmail,
+          error:
+            error.response?.data ||
+            error.message,
+        });
+      }
+
+      /* -----------------------------------------------------
+         5. INITIATE STK PUSH
+         ----------------------------------------------------- */
+
+      const initiatePayload = {
+        amount: String(Math.round(Number(amount))),
+        currency: "TZS",
+        orderReference,
+        phoneNumber: cleanedPhone,
+      };
+
+      initiatePayload.checksum =
+        createPayloadChecksum(
+          CLICKPESA_CHECKSUM_KEY,
+          initiatePayload
+        );
+
+      let clickPesaResponse;
+
+      try {
+        clickPesaResponse =
+          await clickPesaRequest(
+            "POST",
+            "/payments/initiate-ussd-push-request",
+            initiatePayload
+          );
+      } catch (error) {
+        console.error(
+          "ClickPesa test STK initiation failed:",
+          error.response?.data || error.message
+        );
+
+        return res.status(502).json({
+          success: false,
+          message: "ClickPesa STK Push failed.",
+          userId,
+          testEmail,
+          orderReference,
+          error:
+            error.response?.data ||
+            error.message,
+        });
+      }
+
+      /* -----------------------------------------------------
+         6. RETURN EVERYTHING
+         ----------------------------------------------------- */
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Supabase test user created and STK Push sent.",
+        userId,
+        testEmail,
+        testPassword,
+        phoneNumber: cleanedPhone,
+        mobileNetwork,
+        amount: Number(amount),
+        orderReference,
+        clickPesaPreview:
+          previewResponse.data,
+        clickPesaResponse:
+          clickPesaResponse.data,
+      });
+
+    } catch (error) {
+      console.error(
+        "Create user + STK test error:",
+        error.response?.data ||
+        error.message
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Could not create test user and send STK Push.",
+        error:
+          error.response?.data ||
+          error.message,
+      });
+    }
+  }
+);
+
+/* =========================================================
    CLICKPESA PAYMENT STATUS
    ========================================================= */
 
