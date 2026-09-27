@@ -1,474 +1,199 @@
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
-const crypto = require("crypto");
-const { createClient } = require("@supabase/supabase-js");
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+app.use(cors({ origin: '*' }));
+app.use(express.json());
 
-/* =========================================================
-   BASIC SERVER CONFIGURATION
-   ========================================================= */
-
-const PORT = Number(process.env.PORT || 3000);
-
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-
-/* =========================================================
-   ENVIRONMENT VARIABLES
-   ========================================================= */
-
+const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-const CLICKPESA_BASE_URL =
-  process.env.CLICKPESA_BASE_URL ||
-  "https://api.clickpesa.com/third-parties";
-
-const CLICKPESA_API_KEY = process.env.CLICKPESA_API_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const CLICKPESA_BASE_URL = (process.env.CLICKPESA_BASE_URL || 'https://api.clickpesa.com/third-parties').replace(/\/+$/, '');
 const CLICKPESA_CLIENT_ID = process.env.CLICKPESA_CLIENT_ID;
-const CLICKPESA_CHECKSUM_KEY =
-  process.env.CLICKPESA_CHECKSUM_KEY;
-
-/*
-  IMPORTANT:
-  Set ADMIN_API_KEY in Render. The Admin App must send:
-  x-admin-api-key: YOUR_ADMIN_API_KEY
-
-  This protects all /api/admin/* endpoints.
-*/
+const CLICKPESA_API_KEY = process.env.CLICKPESA_API_KEY;
+const CLICKPESA_CHECKSUM_KEY = process.env.CLICKPESA_CHECKSUM_KEY;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 
-const requiredEnvironmentVariables = [
-  ["SUPABASE_URL", SUPABASE_URL],
-  ["SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY],
-  ["CLICKPESA_API_KEY", CLICKPESA_API_KEY],
-  ["CLICKPESA_CLIENT_ID", CLICKPESA_CLIENT_ID],
-  ["CLICKPESA_CHECKSUM_KEY", CLICKPESA_CHECKSUM_KEY],
-  ["ADMIN_API_KEY", ADMIN_API_KEY],
-];
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false }
+});
 
-const missingEnvironmentVariables =
-  requiredEnvironmentVariables
-    .filter(([, value]) => !value)
-    .map(([name]) => name);
-
-if (missingEnvironmentVariables.length > 0) {
-  console.error(
-    "Missing required environment variables:",
-    missingEnvironmentVariables.join(", ")
-  );
+function normalizePhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.startsWith('255')) return digits;
+  if (digits.startsWith('0')) return '255' + digits.slice(1);
+  return '255' + digits;
 }
 
-/* =========================================================
-   SUPABASE
-   ========================================================= */
-
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
+function generateOrderReference(customRef) {
+  if (customRef) {
+    const clean = String(customRef).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    if (clean.length >= 6 && clean.length <= 20) return clean;
   }
-);
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let suffix = '';
+  for (let i = 0; i < 9; i++) {
+    suffix += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return 'SFX' + suffix;
+}
 
-/* =========================================================
-   CLICKPESA TOKEN CACHE
-   ========================================================= */
+function canonicalizeObject(obj) {
+  if (Array.isArray(obj)) {
+    return obj.map(canonicalizeObject);
+  } else if (obj !== null && typeof obj === 'object') {
+    return Object.keys(obj)
+      .sort()
+      .reduce((acc, key) => {
+        if (key !== 'checksum' && key !== 'checksumMethod' && obj[key] !== undefined) {
+          acc[key] = canonicalizeObject(obj[key]);
+        }
+        return acc;
+      }, {});
+  }
+  return obj;
+}
 
-let clickPesaToken = null;
-let clickPesaTokenExpiresAt = 0;
-
-/* =========================================================
-   CLICKPESA AUTHENTICATION
-   ========================================================= */
+function generateClickPesaChecksum(payload, secretKey) {
+  if (!secretKey) return undefined;
+  const canonical = canonicalizeObject(payload);
+  const jsonString = JSON.stringify(canonical);
+  return crypto.createHmac('sha256', secretKey).update(jsonString).digest('hex');
+}
 
 async function getClickPesaToken() {
-  const now = Date.now();
-
-  if (
-    clickPesaToken &&
-    now < clickPesaTokenExpiresAt
-  ) {
-    return clickPesaToken;
-  }
-
-  try {
-    const response = await axios.post(
-      `${CLICKPESA_BASE_URL}/generate-token`,
-      {},
-      {
-        headers: {
-          "api-key": CLICKPESA_API_KEY,
-          "client-id": CLICKPESA_CLIENT_ID,
-          "Content-Type": "application/json",
-        },
-        timeout: 30000,
-      }
-    );
-
-    if (
-      !response.data ||
-      !response.data.success ||
-      !response.data.token
-    ) {
-      throw new Error(
-        "ClickPesa did not return a valid authorization token."
-      );
+  const response = await fetch(`${CLICKPESA_BASE_URL}/generate-token`, {
+    method: 'POST',
+    headers: {
+      'client-id': CLICKPESA_CLIENT_ID,
+      'api-key': CLICKPESA_API_KEY,
+      'Accept': 'application/json'
     }
+  });
 
-    clickPesaToken = response.data.token;
-
-    // Refresh before the one-hour JWT lifetime expires.
-    clickPesaTokenExpiresAt =
-      Date.now() + 55 * 60 * 1000;
-
-    return clickPesaToken;
-  } catch (error) {
-    console.error(
-      "ClickPesa token generation failed:",
-      error.response?.data || error.message
-    );
-
-    throw new Error(
-      "Unable to authenticate with ClickPesa."
-    );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.token) {
+    throw new Error(data.message || data.error || `Failed to generate ClickPesa token (HTTP ${response.status})`);
   }
+  return data.token.startsWith('Bearer ') ? data.token : `Bearer ${data.token}`;
 }
 
-/* =========================================================
-   CLICKPESA REQUEST HELPER
-   ========================================================= */
+async function getSettings() {
+  const { data } = await supabase
+    .from('app_settings')
+    .select('*')
+    .eq('id', 1)
+    .single();
 
-async function clickPesaRequest(
-  method,
-  endpoint,
-  data = null
-) {
-  const token = await getClickPesaToken();
-
-  try {
-    const config = {
-      method,
-      url: `${CLICKPESA_BASE_URL}${endpoint}`,
-      headers: {
-        Authorization: token,
-        "Content-Type": "application/json",
-      },
-      timeout: 30000,
-    };
-
-    if (data !== null) {
-      config.data = data;
-    }
-
-    return await axios(config);
-  } catch (error) {
-    console.error(
-      `ClickPesa request failed [${method} ${endpoint}]:`,
-      error.response?.data || error.message
-    );
-
-    if (error.response?.status === 401) {
-      clickPesaToken = null;
-      clickPesaTokenExpiresAt = 0;
-    }
-
-    throw error;
-  }
-}
-
-/* =========================================================
-   CLICKPESA CHECKSUM
-   ========================================================= */
-
-function canonicalize(value) {
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(canonicalize);
-  }
-
-  return Object.keys(value)
-    .sort()
-    .reduce((result, key) => {
-      result[key] = canonicalize(value[key]);
-      return result;
-    }, {});
-}
-
-function createPayloadChecksum(checksumKey, payload) {
-  const payloadWithoutChecksum = {
-    ...payload,
+  return data || {
+    id: 1,
+    deposit_fee_percentage: 2.5,
+    withdraw_fee_percentage: 2.0,
+    usd_tzs_rate: 2580
   };
-
-  delete payloadWithoutChecksum.checksum;
-  delete payloadWithoutChecksum.checksumMethod;
-
-  const canonicalPayload =
-    canonicalize(payloadWithoutChecksum);
-
-  const payloadString =
-    JSON.stringify(canonicalPayload);
-
-  return crypto
-    .createHmac("sha256", checksumKey)
-    .update(payloadString)
-    .digest("hex");
 }
 
-function verifyChecksum(payload) {
-  if (!payload?.checksum) {
-    return true;
+function requireAdminAuth(req, res, next) {
+  const apiKey = req.headers['x-admin-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || req.query.admin_key;
+  if (ADMIN_API_KEY && apiKey !== ADMIN_API_KEY) {
+    return res.status(401).json({ success: false, error: 'Unauthorized: Invalid ADMIN_API_KEY' });
   }
-
-  const received = String(payload.checksum);
-  const calculated = createPayloadChecksum(
-    CLICKPESA_CHECKSUM_KEY,
-    payload
-  );
-
-  const receivedBuffer = Buffer.from(
-    received,
-    "utf8"
-  );
-  const calculatedBuffer = Buffer.from(
-    calculated,
-    "utf8"
-  );
-
-  if (
-    receivedBuffer.length !==
-    calculatedBuffer.length
-  ) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(
-    receivedBuffer,
-    calculatedBuffer
-  );
-}
-
-/* =========================================================
-   PHONE NUMBER
-   ========================================================= */
-
-function cleanPhoneNumber(phone) {
-  if (!phone) {
-    return "";
-  }
-
-  let cleaned = String(phone)
-    .trim()
-    .replace(/\s+/g, "")
-    .replace(/-/g, "");
-
-  if (cleaned.startsWith("+")) {
-    cleaned = cleaned.substring(1);
-  }
-
-  if (cleaned.startsWith("0")) {
-    cleaned = "255" + cleaned.substring(1);
-  }
-
-  return cleaned;
-}
-
-/* =========================================================
-   NUMBER / INPUT HELPERS
-   ========================================================= */
-
-function isPositiveNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0;
-}
-
-function isValidTransactionId(id) {
-  return (
-    typeof id === "string" &&
-    id.trim().length > 0 &&
-    id.length <= 100
-  );
-}
-
-function roundMoney(value) {
-  return Math.round(
-    (Number(value) + Number.EPSILON) * 100
-  ) / 100;
-}
-
-/* =========================================================
-   FEE HELPER
-   ========================================================= */
-
-async function getFeePercentage(
-  settingName,
-  defaultValue
-) {
-  try {
-    const { data, error } = await supabase
-      .from("app_settings")
-      .select("value")
-      .eq("key", settingName)
-      .maybeSingle();
-
-    if (error) {
-      console.error(
-        `Could not read ${settingName}:`,
-        error.message
-      );
-      return defaultValue;
-    }
-
-    if (!data || data.value === null) {
-      return defaultValue;
-    }
-
-    const value = Number(data.value);
-
-    if (!Number.isFinite(value)) {
-      return defaultValue;
-    }
-
-    return value;
-  } catch (error) {
-    console.error(
-      `Fee lookup failed for ${settingName}:`,
-      error.message
-    );
-
-    return defaultValue;
-  }
-}
-
-/* =========================================================
-   ADMIN AUTHENTICATION
-   ========================================================= */
-
-function requireAdmin(req, res, next) {
-  const suppliedKey =
-    req.get("x-admin-api-key") ||
-    req.get("authorization")?.replace(/^Bearer\s+/i, "");
-
-  if (!ADMIN_API_KEY) {
-    return res.status(503).json({
-      success: false,
-      message:
-        "Admin API is not configured. Set ADMIN_API_KEY on the server.",
-    });
-  }
-
-  if (
-    !suppliedKey ||
-    !crypto.timingSafeEqual(
-      Buffer.from(String(suppliedKey)),
-      Buffer.from(String(ADMIN_API_KEY))
-    )
-  ) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized.",
-    });
-  }
-
   next();
 }
 
-/* =========================================================
-   STATUS HELPERS
-   ========================================================= */
+// 1. HEALTH & SETTINGS
+app.get(['/', '/health', '/api/health'], (req, res) => {
+  res.json({ ok: true, success: true, service: 'SwiftFX Backend API' });
+});
 
-/*
-  Deposit:
-    pending
-    fiat_received
-    crypto_sent
-    completed
-    failed
-    cancelled
-
-  Withdrawal:
-    pending
-    crypto_address_provided
-    crypto_received
-    mobile_money_sent
-    completed
-    failed
-    cancelled
-*/
-
-const SUCCESSFUL_CLICKPESA_STATUSES = [
-  "SUCCESS",
-  "SUCCESSFUL",
-  "COMPLETED",
-  "PAID",
-];
-
-const FAILED_CLICKPESA_STATUSES = [
-  "FAILED",
-  "CANCELLED",
-  "CANCELED",
-  "REJECTED",
-  "DECLINED",
-];
-
-function mapClickPesaStatus(rawStatus) {
-  const status = String(rawStatus || "").toUpperCase();
-
-  if (
-    SUCCESSFUL_CLICKPESA_STATUSES.includes(status)
-  ) {
-    return "fiat_received";
+app.get('/api/settings', async (req, res) => {
+  try {
+    const settings = await getSettings();
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
+});
 
-  if (
-    FAILED_CLICKPESA_STATUSES.includes(status)
-  ) {
-    return "failed";
+app.put('/api/settings', requireAdminAuth, async (req, res) => {
+  try {
+    const { deposit_fee_percentage, withdraw_fee_percentage, usd_tzs_rate } = req.body;
+    const updates = { id: 1, updated_at: new Date().toISOString() };
+    if (deposit_fee_percentage !== undefined) updates.deposit_fee_percentage = Number(deposit_fee_percentage);
+    if (withdraw_fee_percentage !== undefined) updates.withdraw_fee_percentage = Number(withdraw_fee_percentage);
+    if (usd_tzs_rate !== undefined) updates.usd_tzs_rate = Number(usd_tzs_rate);
+
+    const { data, error } = await supabase.from('app_settings').upsert(updates).select().single();
+    if (error) throw error;
+    res.json({ success: true, settings: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
-
-  return "pending";
-}
-
-/* =========================================================
-   HEALTH CHECKS
-   ========================================================= */
-
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    message: "SwiftFX backend is running.",
-  });
 });
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    message: "SwiftFX backend is running.",
-  });
+// 2. CLIENT ORDER TRACKING (Used by Client Frontend without needing Supabase keys)
+app.get('/api/payments/track', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.status(400).json({ success: false, error: 'Query required' });
+
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q);
+    let txn = null;
+
+    if (isUUID) {
+      const { data } = await supabase.from('transactions').select('*').eq('id', q).maybeSingle();
+      txn = data;
+    }
+
+    if (!txn) {
+      const { data } = await supabase
+        .from('transactions')
+        .select('*')
+        .ilike('clickpesa_reference', q)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (data && data.length > 0) txn = data[0];
+    }
+
+    if (!txn) {
+      const { data } = await supabase
+        .from('transactions')
+        .select('*')
+        .eq('user_id', q)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (data && data.length > 0) txn = data[0];
+    }
+
+    if (!txn) return res.status(404).json({ success: false, error: 'Transaction not found' });
+    return res.json({ success: true, transaction: txn });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    success: true,
-    message: "SwiftFX API is healthy.",
-    timestamp: new Date().toISOString(),
-  });
+app.get('/api/payments/user/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(15);
+
+    if (error) throw error;
+    return res.json({ success: true, transactions: data || [] });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
 
-/* =========================================================
-   DEPOSIT
-   ========================================================= */
-
-async function initiateDeposit(req, res) {
+// 3. CLIENT DEPOSIT (Initiates ClickPesa USSD Push)
+app.post('/api/payments/deposit', async (req, res) => {
   try {
     const {
       user_id,
@@ -476,796 +201,197 @@ async function initiateDeposit(req, res) {
       crypto_network,
       mobile_network,
       phone_number,
-      amount,
       crypto_address,
-    } = req.body || {};
+      amount,
+      orderReference
+    } = req.body;
 
-    if (!user_id) {
+    if (!phone_number || !amount || !crypto_address) {
       return res.status(400).json({
         success: false,
-        message: "User ID is required.",
+        error: 'phone_number, amount, and crypto_address are required.'
       });
     }
 
-    if (!crypto_currency) {
-      return res.status(400).json({
-        success: false,
-        message: "Crypto currency is required.",
-      });
-    }
+    const settings = await getSettings();
+    const feePercentage = Number(settings.deposit_fee_percentage || 2.5);
+    const exchangeRate = Number(settings.usd_tzs_rate || 2580);
 
-    if (!crypto_network) {
-      return res.status(400).json({
-        success: false,
-        message: "Crypto network is required.",
-      });
-    }
+    const baseAmountUsd = Number(amount);
+    const feeAmountUsd = Number((baseAmountUsd * (feePercentage / 100)).toFixed(4));
+    const totalAmountUsd = Number((baseAmountUsd + feeAmountUsd).toFixed(4));
+    const amountTzs = Math.max(1000, Math.round(totalAmountUsd * exchangeRate));
 
-    if (!mobile_network) {
-      return res.status(400).json({
-        success: false,
-        message: "Mobile network is required.",
-      });
-    }
+    const cleanPhone = normalizePhone(phone_number);
+    const cleanRef = generateOrderReference(orderReference);
+    const tempUserId = user_id || `guest_${crypto.randomUUID()}`;
 
-    if (!phone_number) {
-      return res.status(400).json({
-        success: false,
-        message: "Phone number is required.",
-      });
-    }
+    const bearerToken = await getClickPesaToken();
 
-    if (!crypto_address) {
-      return res.status(400).json({
-        success: false,
-        message: "Crypto wallet address is required.",
-      });
-    }
-
-    if (!isPositiveNumber(amount)) {
-      return res.status(400).json({
-        success: false,
-        message: "Enter a valid deposit amount.",
-      });
-    }
-
-    const numericAmount = roundMoney(amount);
-
-    const feePercentage =
-      await getFeePercentage(
-        "deposit_fee_percentage",
-        2.5
-      );
-
-    const feeAmount = roundMoney(
-      numericAmount * (feePercentage / 100)
-    );
-
-    const totalAmount = roundMoney(
-      numericAmount + feeAmount
-    );
-
-    const cleanedPhone =
-      cleanPhoneNumber(phone_number);
-
-    if (!/^255\d{9}$/.test(cleanedPhone)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Enter a valid Tanzanian mobile number.",
-      });
-    }
-
-    const transactionData = {
-      user_id,
-      type: "deposit",
-      crypto_currency,
-      crypto_network,
-      mobile_network,
-      phone_number: cleanedPhone,
-      amount: numericAmount,
-      fee_percentage: feePercentage,
-      total_amount: totalAmount,
-      crypto_address: String(crypto_address).trim(),
-      status: "pending",
+    const clickpesaPayload = {
+      amount: String(amountTzs),
+      currency: 'TZS',
+      orderReference: cleanRef,
+      phoneNumber: cleanPhone
     };
 
-    const {
-      data: transaction,
-      error: transactionError,
-    } = await supabase
-      .from("transactions")
-      .insert(transactionData)
+    if (CLICKPESA_CHECKSUM_KEY) {
+      clickpesaPayload.checksum = generateClickPesaChecksum(clickpesaPayload, CLICKPESA_CHECKSUM_KEY);
+    }
+
+    const stkResponse = await fetch(`${CLICKPESA_BASE_URL}/payments/initiate-ussd-push-request`, {
+      method: 'POST',
+      headers: {
+        'Authorization': bearerToken,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(clickpesaPayload)
+    });
+
+    const stkData = await stkResponse.json().catch(() => ({}));
+
+    if (!stkResponse.ok) {
+      return res.status(stkResponse.status).json({
+        success: false,
+        error: stkData.message || stkData.error || 'ClickPesa rejected the USSD push request.',
+        details: stkData
+      });
+    }
+
+    const now = new Date().toISOString();
+    const { data: txn, error: dbError } = await supabase
+      .from('transactions')
+      .insert([{
+        user_id: tempUserId,
+        type: 'deposit',
+        crypto_currency: crypto_currency || 'USDT',
+        crypto_network: crypto_network || 'TRC20',
+        mobile_network: mobile_network || 'Mobile Money',
+        phone_number: cleanPhone,
+        amount: baseAmountUsd,
+        fee_percentage: feePercentage,
+        fee_amount: feeAmountUsd,
+        total_amount: totalAmountUsd,
+        amount_tzs: amountTzs,
+        crypto_address: crypto_address.trim(),
+        status: 'pending_payment',
+        clickpesa_reference: cleanRef,
+        created_at: now,
+        updated_at: now
+      }])
       .select()
       .single();
 
-    if (transactionError) {
-      console.error(
-        "Transaction creation failed:",
-        transactionError.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message: "Could not create the transaction.",
-      });
-    }
-
-    const orderReference = transaction.id;
-
-    /*
-      ClickPesa collection.
-      The mobile-money network is represented by the
-      customer's phone number and ClickPesa's routing.
-    */
-    const previewPayload = {
-      amount: String(Math.round(totalAmount)),
-      currency: "TZS",
-      orderReference,
-      phoneNumber: cleanedPhone,
-      fetchSenderDetails: false,
-    };
-
-    previewPayload.checksum =
-      createPayloadChecksum(
-        CLICKPESA_CHECKSUM_KEY,
-        previewPayload
-      );
-
-    let previewResponse;
-
-    try {
-      previewResponse =
-        await clickPesaRequest(
-          "POST",
-          "/payments/preview-ussd-push-request",
-          previewPayload
-        );
-    } catch (error) {
-      await supabase
-        .from("transactions")
-        .update({
-          status: "failed",
-          admin_notes:
-            "ClickPesa preview request failed.",
-          updated_at:
-            new Date().toISOString(),
-        })
-        .eq("id", transaction.id);
-
-      return res.status(502).json({
-        success: false,
-        message:
-          "ClickPesa could not preview the mobile-money payment.",
-        transactionId: transaction.id,
-        error:
-          error.response?.data ||
-          error.message,
-      });
-    }
-
-    const initiatePayload = {
-      amount: String(Math.round(totalAmount)),
-      currency: "TZS",
-      orderReference,
-      phoneNumber: cleanedPhone,
-    };
-
-    initiatePayload.checksum =
-      createPayloadChecksum(
-        CLICKPESA_CHECKSUM_KEY,
-        initiatePayload
-      );
-
-    let clickPesaResponse;
-
-    try {
-      clickPesaResponse =
-        await clickPesaRequest(
-          "POST",
-          "/payments/initiate-ussd-push-request",
-          initiatePayload
-        );
-    } catch (error) {
-      await supabase
-        .from("transactions")
-        .update({
-          status: "failed",
-          admin_notes:
-            "ClickPesa USSD-PUSH initiation failed.",
-          updated_at:
-            new Date().toISOString(),
-        })
-        .eq("id", transaction.id);
-
-      return res.status(502).json({
-        success: false,
-        message:
-          "ClickPesa could not start the mobile-money payment.",
-        transactionId: transaction.id,
-        error:
-          error.response?.data ||
-          error.message,
-      });
-    }
-
-    const clickPesaData =
-      clickPesaResponse.data;
-
-    const clickPesaReference =
-      clickPesaData?.id ||
-      clickPesaData?.paymentReference ||
-      clickPesaData?.orderReference ||
-      orderReference;
-
-    const { error: updateError } =
-      await supabase
-        .from("transactions")
-        .update({
-          clickpesa_reference:
-            clickPesaReference,
-          status: "pending",
-          updated_at:
-            new Date().toISOString(),
-        })
-        .eq("id", transaction.id);
-
-    if (updateError) {
-      console.error(
-        "Could not save ClickPesa reference:",
-        updateError.message
-      );
-    }
-
-    return res.status(200).json({
-      success: true,
-      message:
-        "Payment request sent. Please enter your mobile-money PIN.",
-      transactionId: transaction.id,
-      orderReference,
-      clickpesaReference,
-      amount: numericAmount,
-      feePercentage,
-      feeAmount,
-      totalAmount,
-      phoneNumber: cleanedPhone,
-      cryptoCurrency: crypto_currency,
-      cryptoNetwork: crypto_network,
-      mobileNetwork: mobile_network,
-      cryptoAddress: crypto_address,
-      stkPushSent: true,
-      clickPesaPreview: previewResponse.data,
-      clickPesaResponse: clickPesaData,
-    });
-  } catch (error) {
-    console.error(
-      "Deposit error:",
-      error.response?.data ||
-        error.message
-    );
-
-    return res.status(500).json({
-      success: false,
-      message:
-        "An unexpected error occurred while starting the deposit.",
-    });
-  }
-}
-
-app.post(
-  "/api/deposit/initiate",
-  initiateDeposit
-);
-
-app.post(
-  "/api/payments/deposit",
-  initiateDeposit
-);
-
-/* =========================================================
-   TEMP TEST — CREATE USER + SEND STK PUSH
-   REMOVE THIS ENDPOINT AFTER TESTING
-   ========================================================= */
-
-app.post(
-  "/api/test/create-user-and-stk",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const {
-        phone_number,
-        amount,
-        mobile_network = "Vodacom",
-      } = req.body || {};
-
-      if (!phone_number) {
-        return res.status(400).json({
-          success: false,
-          message: "Phone number is required.",
-        });
-      }
-
-      if (!amount || Number(amount) <= 0) {
-        return res.status(400).json({
-          success: false,
-          message: "A valid amount is required.",
-        });
-      }
-
-      /* -----------------------------------------------------
-         1. CLEAN PHONE NUMBER
-         ----------------------------------------------------- */
-
-      const cleanedPhone = cleanPhoneNumber(phone_number);
-
-      if (!cleanedPhone.startsWith("255")) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid Tanzania phone number.",
-        });
-      }
-
-      /* -----------------------------------------------------
-         2. CREATE A SUPABASE AUTH USER
-         ----------------------------------------------------- */
-
-      const testEmail =
-        `test_${Date.now()}@swiftfx.test`;
-
-      const testPassword =
-        `SwiftFXTest_${Date.now()}!`;
-
-      const {
-        data: authData,
-        error: authError,
-      } = await supabase.auth.admin.createUser({
-        email: testEmail,
-        password: testPassword,
-        email_confirm: true,
-      });
-
-      if (authError) {
-        console.error(
-          "Test Supabase user creation failed:",
-          authError.message
-        );
-
-        return res.status(500).json({
-          success: false,
-          message: "Could not create Supabase user.",
-          error: authError.message,
-        });
-      }
-
-      const userId = authData.user.id;
-
-      /* -----------------------------------------------------
-         3. GENERATE CLICKPESA-SAFE ORDER REFERENCE
-         ----------------------------------------------------- */
-
-      const orderReference =
-  `SW${Date.now().toString().slice(-12)}`;
-
-      /* -----------------------------------------------------
-         4. CREATE CLICKPESA PREVIEW REQUEST
-         ----------------------------------------------------- */
-
-      const previewPayload = {
-        amount: String(Math.round(Number(amount))),
-        currency: "TZS",
-        orderReference,
-        phoneNumber: cleanedPhone,
-        fetchSenderDetails: false,
-      };
-
-      previewPayload.checksum =
-        createPayloadChecksum(
-          CLICKPESA_CHECKSUM_KEY,
-          previewPayload
-        );
-
-      let previewResponse;
-
-      try {
-        previewResponse =
-          await clickPesaRequest(
-            "POST",
-            "/payments/preview-ussd-push-request",
-            previewPayload
-          );
-      } catch (error) {
-        console.error(
-          "ClickPesa test preview failed:",
-          error.response?.data || error.message
-        );
-
-        return res.status(502).json({
-          success: false,
-          message: "ClickPesa preview failed.",
-          userId,
-          testEmail,
-          error:
-            error.response?.data ||
-            error.message,
-        });
-      }
-
-      /* -----------------------------------------------------
-         5. INITIATE STK PUSH
-         ----------------------------------------------------- */
-
-      const initiatePayload = {
-        amount: String(Math.round(Number(amount))),
-        currency: "TZS",
-        orderReference,
-        phoneNumber: cleanedPhone,
-      };
-
-      initiatePayload.checksum =
-        createPayloadChecksum(
-          CLICKPESA_CHECKSUM_KEY,
-          initiatePayload
-        );
-
-      let clickPesaResponse;
-
-      try {
-        clickPesaResponse =
-          await clickPesaRequest(
-            "POST",
-            "/payments/initiate-ussd-push-request",
-            initiatePayload
-          );
-      } catch (error) {
-        console.error(
-          "ClickPesa test STK initiation failed:",
-          error.response?.data || error.message
-        );
-
-        return res.status(502).json({
-          success: false,
-          message: "ClickPesa STK Push failed.",
-          userId,
-          testEmail,
-          orderReference,
-          error:
-            error.response?.data ||
-            error.message,
-        });
-      }
-
-      /* -----------------------------------------------------
-         6. RETURN EVERYTHING
-         ----------------------------------------------------- */
-
-      return res.status(200).json({
-        success: true,
-        message:
-          "Supabase test user created and STK Push sent.",
-        userId,
-        testEmail,
-        testPassword,
-        phoneNumber: cleanedPhone,
-        mobileNetwork,
-        amount: Number(amount),
-        orderReference,
-        clickPesaPreview:
-          previewResponse.data,
-        clickPesaResponse:
-          clickPesaResponse.data,
-      });
-
-    } catch (error) {
-      console.error(
-        "Create user + STK test error:",
-        error.response?.data ||
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not create test user and send STK Push.",
-        error:
-          error.response?.data ||
-          error.message,
-      });
-    }
-  }
-);
-
-/* =========================================================
-   CLICKPESA PAYMENT STATUS
-   ========================================================= */
-
-async function getPaymentStatus(req, res) {
-  try {
-    const { orderReference } = req.params;
-
-    if (!orderReference) {
-      return res.status(400).json({
-        success: false,
-        message: "Order reference is required.",
-      });
-    }
-
-    const response =
-      await clickPesaRequest(
-        "GET",
-        `/payments/${encodeURIComponent(
-          orderReference
-        )}`
-      );
-
-    const payments =
-      Array.isArray(response.data)
-        ? response.data
-        : response.data?.data ||
-          response.data?.payments ||
-          [];
-
-    const payment =
-      payments.length > 0
-        ? payments[0]
-        : response.data;
-
-    const localStatus =
-      mapClickPesaStatus(
-        payment?.status
-      );
-
-    /*
-      Never downgrade a transaction that has already
-      progressed beyond fiat_received.
-    */
-    const { data: existing } =
-      await supabase
-        .from("transactions")
-        .select("id,status")
-        .eq("id", orderReference)
-        .maybeSingle();
-
-    const advancedStatuses = [
-      "crypto_sent",
-      "crypto_received",
-      "mobile_money_sent",
-      "completed",
-    ];
-
-    if (
-      existing &&
-      advancedStatuses.includes(existing.status) &&
-      localStatus !== "failed"
-    ) {
-      return res.json({
-        success: true,
-        orderReference,
-        status: payment?.status || null,
-        localStatus: existing.status,
-        payment,
-      });
-    }
-
-    const { error: updateError } =
-      await supabase
-        .from("transactions")
-        .update({
-          status: localStatus,
-          updated_at:
-            new Date().toISOString(),
-        })
-        .eq("id", orderReference);
-
-    if (updateError) {
-      console.error(
-        "Local payment status update failed:",
-        updateError.message
-      );
-    }
+    if (dbError) throw dbError;
 
     return res.json({
       success: true,
-      orderReference,
-      status: payment?.status || null,
-      localStatus,
-      payment,
+      stkPushSent: true,
+      message: `USSD Push sent to +${cleanPhone} for ${amountTzs.toLocaleString()} TZS. Enter your PIN to confirm.`,
+      transaction: txn
     });
-  } catch (error) {
-    console.error(
-      "Payment status error:",
-      error.response?.data ||
-        error.message
-    );
-
-    return res.status(502).json({
+  } catch (err) {
+    return res.status(500).json({
       success: false,
-      message:
-        "Could not retrieve payment status from ClickPesa.",
-      error:
-        error.response?.data ||
-        error.message,
+      error: err.message || 'Internal server error during deposit initiation.'
     });
   }
-}
+});
 
-app.get(
-  "/api/payments/status/:orderReference",
-  getPaymentStatus
-);
+// 4. CLICKPESA WEBHOOK (Detects Deposit & Alerts Admin App)
+app.post(['/api/webhooks/clickpesa', '/webhooks/clickpesa', '/api/payments/webhook'], async (req, res) => {
+  try {
+    const body = req.body || {};
+    const eventType = String(body.event || body.eventType || body.status || '').toUpperCase();
+    const dataObj = body.data || body.transaction || body;
+    const orderReference =
+      dataObj.orderReference ||
+      dataObj.order_reference ||
+      dataObj.reference ||
+      body.orderReference;
 
-/* =========================================================
-   CLICKPESA WEBHOOK
-   ========================================================= */
+    const paymentStatus = String(dataObj.status || body.status || eventType).toUpperCase();
 
-app.post(
-  "/api/clickpesa/webhook",
-  async (req, res) => {
-    try {
-      const payload = req.body || {};
-
-      console.log(
-        "ClickPesa webhook received:",
-        payload
-      );
-
-      if (!verifyChecksum(payload)) {
-        console.error(
-          "Invalid ClickPesa webhook checksum."
-        );
-
-        return res.status(401).json({
-          success: false,
-          message: "Invalid webhook checksum.",
-        });
-      }
-
-      const orderReference =
-        payload?.orderReference ||
-        payload?.reference ||
-        payload?.order_reference;
-
-      if (!orderReference) {
-        return res.status(400).json({
-          success: false,
-          message: "Order reference missing.",
-        });
-      }
-
-      const rawStatus =
-        payload?.status ||
-        payload?.transaction_status ||
-        payload?.paymentStatus ||
-        "";
-
-      const localStatus =
-        mapClickPesaStatus(rawStatus);
-
-      /*
-        First try our transaction UUID.
-      */
-      const { data: byId } =
-        await supabase
-          .from("transactions")
-          .select("id,status,type")
-          .eq("id", orderReference)
-          .maybeSingle();
-
-      let transaction = byId;
-
-      /*
-        If ClickPesa used its own reference, find the
-        transaction using clickpesa_reference.
-      */
-      if (!transaction) {
-        const { data: byReference } =
-          await supabase
-            .from("transactions")
-            .select("id,status,type")
-            .eq(
-              "clickpesa_reference",
-              orderReference
-            )
-            .maybeSingle();
-
-        transaction = byReference;
-      }
-
-      if (!transaction) {
-        console.error(
-          "Webhook transaction not found:",
-          orderReference
-        );
-
-        /*
-          Return 200 so ClickPesa does not repeatedly
-          resend a webhook for an unknown local record.
-        */
-        return res.status(200).json({
-          success: false,
-          message:
-            "Webhook received, but transaction was not found.",
-        });
-      }
-
-      /*
-        A successful ClickPesa collection only proves
-        that fiat was received. It must never directly
-        mark a crypto transaction as completed.
-      */
-      const advancedStatuses = [
-        "crypto_sent",
-        "crypto_received",
-        "mobile_money_sent",
-        "completed",
-      ];
-
-      if (
-        advancedStatuses.includes(
-          transaction.status
-        ) &&
-        localStatus !== "failed"
-      ) {
-        return res.status(200).json({
-          success: true,
-          message:
-            "Webhook received; transaction already progressed.",
-        });
-      }
-
-      const updateData = {
-        status: localStatus,
-        updated_at:
-          new Date().toISOString(),
-      };
-
-      if (localStatus === "fiat_received") {
-        updateData.admin_notes =
-          "Mobile-money payment confirmed by ClickPesa. Awaiting admin crypto settlement.";
-      }
-
-      const { error } =
-        await supabase
-          .from("transactions")
-          .update(updateData)
-          .eq("id", transaction.id);
-
-      if (error) {
-        console.error(
-          "Webhook transaction update failed:",
-          error.message
-        );
-
-        return res.status(500).json({
-          success: false,
-          message: "Could not update transaction.",
-        });
-      }
-
-      return res.status(200).json({
-        success: true,
-        message:
-          "Webhook processed successfully.",
-      });
-    } catch (error) {
-      console.error(
-        "Webhook error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Webhook processing failed.",
-      });
+    if (!orderReference) {
+      return res.status(200).json({ received: true });
     }
+
+    const { data: txn } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('clickpesa_reference', orderReference)
+      .maybeSingle();
+
+    if (!txn) {
+      return res.status(200).json({ received: true });
+    }
+
+    const isSuccess =
+      eventType.includes('RECEIVED') ||
+      eventType.includes('SUCCESS') ||
+      paymentStatus === 'SUCCESS' ||
+      paymentStatus === 'SUCCESSFUL' ||
+      paymentStatus === 'COMPLETED' ||
+      paymentStatus === 'SETTLED';
+
+    const isFailed =
+      eventType.includes('FAILED') ||
+      paymentStatus === 'FAILED' ||
+      paymentStatus === 'REJECTED' ||
+      paymentStatus === 'CANCELLED';
+
+    if (isSuccess && txn.status !== 'completed') {
+      const now = new Date().toISOString();
+      const { data: updatedTxn } = await supabase
+        .from('transactions')
+        .update({ status: 'fiat_received', updated_at: now })
+        .eq('id', txn.id)
+        .select()
+        .single();
+
+      await supabase.from('admin_notifications').insert([{
+        transaction_id: txn.id,
+        type: 'deposit_webhook_confirmed',
+        title: `New Confirmed Deposit: $${Number(txn.amount).toFixed(2)} ${txn.crypto_currency} (${txn.crypto_network})`,
+        message: `ClickPesa confirmed payment of ${Number(txn.amount_tzs).toLocaleString()} TZS from +${txn.phone_number} (${txn.mobile_network}). Send $${Number(txn.amount).toFixed(2)} ${txn.crypto_currency} (${txn.crypto_network}) to wallet: ${txn.crypto_address}`,
+        payload: {
+          transaction_id: txn.id,
+          user_id: txn.user_id,
+          crypto_currency: txn.crypto_currency,
+          crypto_network: txn.crypto_network,
+          deposit_amount: txn.amount,
+          total_paid_usd: txn.total_amount,
+          amount_tzs: txn.amount_tzs,
+          phone_number: txn.phone_number,
+          mobile_network: txn.mobile_network,
+          crypto_address: txn.crypto_address,
+          clickpesa_reference: txn.clickpesa_reference
+        }
+      }]);
+
+      return res.status(200).json({ success: true, transaction: updatedTxn });
+    }
+
+    if (isFailed && txn.status === 'pending_payment') {
+      await supabase
+        .from('transactions')
+        .update({
+          status: 'failed',
+          admin_message: 'Mobile money USSD payment failed or was cancelled.',
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', txn.id);
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    return res.status(200).json({ received: true, error: err.message });
   }
-);
+});
 
-/* =========================================================
-   WITHDRAWAL
-   ========================================================= */
-
-async function initiateWithdrawal(req, res) {
+// 5. CLIENT WITHDRAWAL
+app.post('/api/payments/withdraw', async (req, res) => {
   try {
     const {
       user_id,
@@ -1273,1155 +399,225 @@ async function initiateWithdrawal(req, res) {
       crypto_network,
       mobile_network,
       phone_number,
-      amount,
-    } = req.body || {};
+      amount
+    } = req.body;
 
-    if (!user_id) {
+    if (!phone_number || !amount) {
       return res.status(400).json({
         success: false,
-        message: "User ID is required.",
+        error: 'phone_number and amount are required.'
       });
     }
 
-    if (!crypto_currency) {
-      return res.status(400).json({
-        success: false,
-        message: "Crypto currency is required.",
-      });
-    }
+    const settings = await getSettings();
+    const feePercentage = Number(settings.withdraw_fee_percentage || 2.0);
+    const exchangeRate = Number(settings.usd_tzs_rate || 2580);
 
-    if (!crypto_network) {
-      return res.status(400).json({
-        success: false,
-        message: "Crypto network is required.",
-      });
-    }
+    const baseAmountUsd = Number(amount);
+    const feeAmountUsd = Number((baseAmountUsd * (feePercentage / 100)).toFixed(4));
+    const netAmountUsd = Number(Math.max(0, baseAmountUsd - feeAmountUsd).toFixed(4));
+    const payoutTzs = Math.round(netAmountUsd * exchangeRate);
 
-    if (!mobile_network) {
-      return res.status(400).json({
-        success: false,
-        message: "Mobile network is required.",
-      });
-    }
+    const cleanPhone = normalizePhone(phone_number);
+    const cleanRef = generateOrderReference();
+    const tempUserId = user_id || `guest_${crypto.randomUUID()}`;
 
-    if (!phone_number) {
-      return res.status(400).json({
-        success: false,
-        message: "Phone number is required.",
-      });
-    }
-
-    if (!isPositiveNumber(amount)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Enter a valid withdrawal amount.",
-      });
-    }
-
-    const numericAmount = roundMoney(amount);
-
-    const feePercentage =
-      await getFeePercentage(
-        "withdraw_fee_percentage",
-        2
-      );
-
-    const feeAmount = roundMoney(
-      numericAmount * (feePercentage / 100)
-    );
-
-    const amountAfterFee = roundMoney(
-      numericAmount - feeAmount
-    );
-
-    if (amountAfterFee <= 0) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Withdrawal amount is too small after fees.",
-      });
-    }
-
-    const cleanedPhone =
-      cleanPhoneNumber(phone_number);
-
-    if (!/^255\d{9}$/.test(cleanedPhone)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Enter a valid Tanzanian mobile number.",
-      });
-    }
-
-    /*
-      The crypto address is intentionally not created
-      here. The admin will provide the address after
-      reviewing the withdrawal request.
-    */
-    const transactionData = {
-      user_id,
-      type: "withdrawal",
-      crypto_currency,
-      crypto_network,
-      mobile_network,
-      phone_number: cleanedPhone,
-      amount: numericAmount,
-      fee_percentage: feePercentage,
-      total_amount: amountAfterFee,
-      crypto_address:
-        "PENDING_ADMIN_ADDRESS",
-      status: "pending",
-      admin_notes:
-        "Withdrawal received. Awaiting admin crypto deposit address.",
-    };
-
-    const {
-      data: transaction,
-      error,
-    } = await supabase
-      .from("transactions")
-      .insert(transactionData)
+    const now = new Date().toISOString();
+    const { data: txn, error: dbError } = await supabase
+      .from('transactions')
+      .insert([{
+        user_id: tempUserId,
+        type: 'withdrawal',
+        crypto_currency: crypto_currency || 'USDT',
+        crypto_network: crypto_network || 'TRC20',
+        mobile_network: mobile_network || 'Mobile Money',
+        phone_number: cleanPhone,
+        amount: baseAmountUsd,
+        fee_percentage: feePercentage,
+        fee_amount: feeAmountUsd,
+        total_amount: netAmountUsd,
+        amount_tzs: payoutTzs,
+        crypto_address: '',
+        status: 'awaiting_admin_wallet',
+        clickpesa_reference: cleanRef,
+        admin_message: `Withdrawal request received! Waiting for Admin to send our ${crypto_currency} (${crypto_network}) wallet address. Transaction fee: ${feePercentage}% ($${feeAmountUsd.toFixed(2)} USD).`,
+        created_at: now,
+        updated_at: now
+      }])
       .select()
       .single();
 
-    if (error) {
-      console.error(
-        "Withdrawal creation failed:",
-        error.message
-      );
+    if (dbError) throw dbError;
 
-      return res.status(500).json({
-        success: false,
-        message: "Could not create withdrawal.",
-      });
-    }
+    await supabase.from('admin_notifications').insert([{
+      transaction_id: txn.id,
+      type: 'withdrawal_requested',
+      title: `New Withdrawal Request: $${baseAmountUsd.toFixed(2)} ${txn.crypto_currency} (${txn.crypto_network})`,
+      message: `Client (${tempUserId}) wants to withdraw $${baseAmountUsd.toFixed(2)} ${txn.crypto_currency} on ${txn.crypto_network} to ${txn.mobile_network} (+${cleanPhone}). Fee: ${feePercentage}% ($${feeAmountUsd.toFixed(2)}). Net Payout: ${payoutTzs.toLocaleString()} TZS. Send your ${txn.crypto_currency} wallet address to client.`,
+      payload: {
+        transaction_id: txn.id,
+        user_id: tempUserId,
+        crypto_currency: txn.crypto_currency,
+        crypto_network: txn.crypto_network,
+        mobile_network: txn.mobile_network,
+        phone_number: cleanPhone,
+        withdraw_amount_usd: baseAmountUsd,
+        fee_percentage: feePercentage,
+        fee_amount_usd: feeAmountUsd,
+        net_payout_tzs: payoutTzs
+      }
+    }]);
 
-    return res.status(200).json({
+    return res.json({
       success: true,
-      message:
-        "Withdrawal request submitted successfully. Awaiting crypto deposit instructions.",
-      transactionId: transaction.id,
-      amount: numericAmount,
-      feePercentage,
-      feeAmount,
-      amountAfterFee,
-      phoneNumber: cleanedPhone,
-      cryptoCurrency: crypto_currency,
-      cryptoNetwork: crypto_network,
-      mobileNetwork: mobile_network,
-      status: "pending",
+      message: 'Withdrawal request sent to Admin.',
+      transaction: txn
     });
-  } catch (error) {
-    console.error(
-      "Withdrawal error:",
-      error.message
-    );
-
+  } catch (err) {
     return res.status(500).json({
       success: false,
-      message:
-        "An unexpected error occurred while creating the withdrawal.",
+      error: err.message || 'Internal server error during withdrawal creation.'
     });
   }
-}
+});
 
-app.post(
-  "/api/withdraw/initiate",
-  initiateWithdrawal
-);
+app.post('/api/payments/withdraw/:id/confirm-crypto', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tx_hash } = req.body || {};
 
-app.post(
-  "/api/payments/withdraw",
-  initiateWithdrawal
-);
+    const { data: txn, error } = await supabase
+      .from('transactions')
+      .update({
+        status: 'crypto_received',
+        tx_hash: tx_hash || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
 
-/* =========================================================
-   ADMIN — LIST TRANSACTIONS
-   ========================================================= */
+    if (error) throw error;
 
-app.get(
-  "/api/admin/transactions",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const {
-        status,
-        type,
-        limit = 100,
-      } = req.query;
-
-      const safeLimit = Math.min(
-        Math.max(Number(limit) || 100, 1),
-        500
-      );
-
-      let query = supabase
-        .from("transactions")
-        .select("*")
-        .order("created_at", {
-          ascending: false,
-        })
-        .limit(safeLimit);
-
-      if (status) {
-        query = query.eq("status", status);
+    await supabase.from('admin_notifications').insert([{
+      transaction_id: txn.id,
+      type: 'crypto_deposit_sent',
+      title: `Client Sent Crypto: $${Number(txn.amount).toFixed(2)} ${txn.crypto_currency}`,
+      message: `Client marked $${Number(txn.amount).toFixed(2)} ${txn.crypto_currency} (${txn.crypto_network}) as sent to ${txn.crypto_address}. Verify wallet balance, send ${Number(txn.amount_tzs).toLocaleString()} TZS to +${txn.phone_number} (${txn.mobile_network}), and click Approve.`,
+      payload: {
+        transaction_id: txn.id,
+        tx_hash: tx_hash || null,
+        phone_number: txn.phone_number,
+        amount_tzs: txn.amount_tzs
       }
+    }]);
 
-      if (type) {
-        query = query.eq("type", type);
-      }
+    res.json({ success: true, transaction: txn });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-      const { data, error } = await query;
+// 6. ADMIN APP ENDPOINTS
+app.get('/api/admin/transactions', requireAdminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json({ success: true, transactions: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-      if (error) {
-        console.error(
-          "Admin transaction list failed:",
-          error.message
-        );
+app.get('/api/admin/notifications', requireAdminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('admin_notifications')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    res.json({ success: true, notifications: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transactions.",
-        });
-      }
+app.post('/api/admin/transactions/:id/send-wallet', requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { crypto_address, custom_note } = req.body;
 
-      return res.json({
-        success: true,
-        transactions: data || [],
-      });
-    } catch (error) {
-      console.error(
-        "Admin transaction list error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not retrieve transactions.",
-      });
+    if (!crypto_address) {
+      return res.status(400).json({ success: false, error: 'crypto_address is required' });
     }
+
+    const { data: existing } = await supabase.from('transactions').select('*').eq('id', id).single();
+    if (!existing) return res.status(404).json({ success: false, error: 'Transaction not found' });
+
+    const feeUsd = (Number(existing.amount) * (Number(existing.fee_percentage) / 100)).toFixed(2);
+    const adminMsg = custom_note ||
+      `Please send exactly $${Number(existing.amount).toFixed(2)} ${existing.crypto_currency} on ${existing.crypto_network} to our wallet address: ${crypto_address.trim()}. Transaction fee: ${existing.fee_percentage}% ($${feeUsd} USD). Once received, we will send ${Number(existing.amount_tzs).toLocaleString()} TZS to +${existing.phone_number} (${existing.mobile_network}).`;
+
+    const { data: updated, error } = await supabase
+      .from('transactions')
+      .update({
+        crypto_address: crypto_address.trim(),
+        status: 'awaiting_crypto_deposit',
+        admin_message: adminMsg,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, transaction: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
-);
+});
 
-/* =========================================================
-   ADMIN — GET ONE TRANSACTION
-   ========================================================= */
+app.post('/api/admin/transactions/:id/approve', requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tx_hash, admin_message } = req.body || {};
 
-app.get(
-  "/api/admin/transactions/:id",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+    const { data: existing } = await supabase.from('transactions').select('*').eq('id', id).single();
+    if (!existing) return res.status(404).json({ success: false, error: 'Transaction not found' });
 
-      if (!isValidTransactionId(id)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid transaction ID.",
-        });
-      }
+    const feeUsd = (Number(existing.amount) * (Number(existing.fee_percentage) / 100)).toFixed(2);
 
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!data) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        transaction: data,
-      });
-    } catch (error) {
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not retrieve transaction.",
-      });
+    let defaultMessage = '';
+    if (existing.type === 'deposit') {
+      defaultMessage = `Deposit Approved! We have sent $${Number(existing.amount).toFixed(2)} ${existing.crypto_currency} (${existing.crypto_network}) to your wallet address: ${existing.crypto_address}. Total Paid: $${Number(existing.total_amount).toFixed(2)} USD (${Number(existing.amount_tzs).toLocaleString()} TZS including ${existing.fee_percentage}% fee). Reference: ${existing.clickpesa_reference}${tx_hash ? ' · TxHash: ' + tx_hash : ''}.`;
+    } else {
+      defaultMessage = `Withdrawal Approved & Sent! We have sent ${Number(existing.amount_tzs).toLocaleString()} TZS to your ${existing.mobile_network} number +${existing.phone_number}. Withdraw Amount: $${Number(existing.amount).toFixed(2)} ${existing.crypto_currency} · Transaction Fee (${existing.fee_percentage}%): -$${feeUsd} USD · Net Settled: $${Number(existing.total_amount).toFixed(2)} USD. Reference: ${existing.clickpesa_reference}.`;
     }
+
+    const { data: updated, error } = await supabase
+      .from('transactions')
+      .update({
+        status: 'completed',
+        tx_hash: tx_hash || existing.tx_hash || null,
+        admin_message: admin_message || defaultMessage,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, transaction: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
-);
+});
 
-/* =========================================================
-   ADMIN — DEPOSIT: MARK CRYPTO SENT
-   ========================================================= */
-
-app.post(
-  "/api/admin/transactions/:id/deposit/crypto-sent",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const {
-        crypto_tx_hash,
-        admin_notes,
-      } = req.body || {};
-
-      if (!isValidTransactionId(id)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid transaction ID.",
-        });
-      }
-
-      if (
-        !crypto_tx_hash ||
-        !String(crypto_tx_hash).trim()
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Crypto transaction hash is required.",
-        });
-      }
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.type !== "deposit") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transaction is not a deposit.",
-        });
-      }
-
-      if (
-        ![
-          "fiat_received",
-          "crypto_sent",
-        ].includes(transaction.status)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "The deposit must have confirmed mobile-money payment before crypto can be marked as sent.",
-          currentStatus: transaction.status,
-        });
-      }
-
-      const updateData = {
-        crypto_tx_hash:
-          String(crypto_tx_hash).trim(),
-        crypto_sent_at:
-          new Date().toISOString(),
-        status: "crypto_sent",
-        updated_at:
-          new Date().toISOString(),
-      };
-
-      if (admin_notes) {
-        updateData.admin_notes =
-          String(admin_notes).trim();
-      }
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not update deposit.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message:
-          "Deposit marked as crypto sent.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin deposit crypto-sent error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not update deposit.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — DEPOSIT: COMPLETE
-   ========================================================= */
-
-app.post(
-  "/api/admin/transactions/:id/deposit/complete",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.type !== "deposit") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transaction is not a deposit.",
-        });
-      }
-
-      if (
-        transaction.status !== "crypto_sent" ||
-        !transaction.crypto_tx_hash
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Crypto must be marked as sent with a transaction hash before completing the deposit.",
-          currentStatus: transaction.status,
-        });
-      }
-
-      const now = new Date().toISOString();
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update({
-            status: "completed",
-            completed_at: now,
-            updated_at: now,
-          })
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not complete deposit.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message: "Deposit completed.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin deposit completion error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not complete deposit.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — WITHDRAWAL: PROVIDE CRYPTO ADDRESS
-   ========================================================= */
-
-app.post(
-  "/api/admin/transactions/:id/withdrawal/crypto-address",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const {
-        admin_crypto_address,
-        admin_notes,
-      } = req.body || {};
-
-      if (
-        !admin_crypto_address ||
-        !String(admin_crypto_address).trim()
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Crypto deposit address is required.",
-        });
-      }
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.type !== "withdrawal") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transaction is not a withdrawal.",
-        });
-      }
-
-      if (
-        ![
-          "pending",
-          "crypto_address_provided",
-        ].includes(transaction.status)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "The crypto address can only be provided while the withdrawal is awaiting the customer's crypto payment.",
-          currentStatus: transaction.status,
-        });
-      }
-
-      const address =
-        String(admin_crypto_address).trim();
-
-      const updateData = {
-        admin_crypto_address: address,
-        crypto_address: address,
-        status: "crypto_address_provided",
-        updated_at:
-          new Date().toISOString(),
-      };
-
-      if (admin_notes) {
-        updateData.admin_notes =
-          String(admin_notes).trim();
-      }
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not save crypto address.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message:
-          "Crypto deposit address provided to the withdrawal transaction.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin withdrawal address error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not provide crypto address.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — WITHDRAWAL: MARK CRYPTO RECEIVED
-   ========================================================= */
-
-app.post(
-  "/api/admin/transactions/:id/withdrawal/crypto-received",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const {
-        crypto_tx_hash,
-        admin_notes,
-      } = req.body || {};
-
-      if (
-        !crypto_tx_hash ||
-        !String(crypto_tx_hash).trim()
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Crypto transaction hash is required.",
-        });
-      }
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.type !== "withdrawal") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transaction is not a withdrawal.",
-        });
-      }
-
-      if (
-        ![
-          "crypto_address_provided",
-          "crypto_received",
-        ].includes(transaction.status)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "The withdrawal must first have an admin crypto address.",
-          currentStatus: transaction.status,
-        });
-      }
-
-      const updateData = {
-        crypto_tx_hash:
-          String(crypto_tx_hash).trim(),
-        crypto_received_at:
-          new Date().toISOString(),
-        status: "crypto_received",
-        updated_at:
-          new Date().toISOString(),
-      };
-
-      if (admin_notes) {
-        updateData.admin_notes =
-          String(admin_notes).trim();
-      }
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not mark crypto as received.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message:
-          "Crypto marked as received.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin withdrawal crypto-received error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not mark crypto as received.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — WITHDRAWAL: MARK MOBILE MONEY SENT
-   ========================================================= */
-
-/*
-  We intentionally do NOT invent a ClickPesa payout API
-  endpoint or payload here.
-
-  The admin can make the payout through the ClickPesa
-  dashboard/API workflow that is actually enabled for
-  the merchant account, then use this endpoint to record
-  the payout in SwiftFX.
-
-  Once ClickPesa's exact payout API contract is supplied,
-  this endpoint can be changed to trigger the payout
-  automatically.
-*/
-
-app.post(
-  "/api/admin/transactions/:id/withdrawal/mobile-money-sent",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const {
-        payout_reference,
-        admin_notes,
-      } = req.body || {};
-
-      if (
-        !payout_reference ||
-        !String(payout_reference).trim()
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Mobile-money payout reference is required.",
-        });
-      }
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.type !== "withdrawal") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transaction is not a withdrawal.",
-        });
-      }
-
-      if (
-        ![
-          "crypto_received",
-          "mobile_money_sent",
-        ].includes(transaction.status)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Crypto must be received before mobile money can be marked as sent.",
-          currentStatus: transaction.status,
-        });
-      }
-
-      const now = new Date().toISOString();
-
-      const updateData = {
-        status: "mobile_money_sent",
-        mobile_money_sent_at: now,
-        updated_at: now,
-        admin_notes:
-          admin_notes
-            ? String(admin_notes).trim()
-            : `Mobile-money payout reference: ${String(
-                payout_reference
-              ).trim()}`,
-      };
-
-      /*
-        We store the payout reference in admin_notes because
-        the current Supabase schema does not contain a separate
-        payout_reference column.
-      */
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not record mobile-money payout.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message:
-          "Mobile-money payout recorded as sent.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin mobile-money payout error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not record mobile-money payout.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — WITHDRAWAL: COMPLETE
-   ========================================================= */
-
-app.post(
-  "/api/admin/transactions/:id/withdrawal/complete",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.type !== "withdrawal") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transaction is not a withdrawal.",
-        });
-      }
-
-      if (
-        transaction.status !==
-        "mobile_money_sent"
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Mobile money must be marked as sent before completing the withdrawal.",
-          currentStatus: transaction.status,
-        });
-      }
-
-      const now = new Date().toISOString();
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update({
-            status: "completed",
-            completed_at: now,
-            updated_at: now,
-          })
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not complete withdrawal.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message: "Withdrawal completed.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin withdrawal completion error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not complete withdrawal.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — CANCEL TRANSACTION
-   ========================================================= */
-
-app.post(
-  "/api/admin/transactions/:id/cancel",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { admin_notes } = req.body || {};
-
-      const { data: transaction, error: findError } =
-        await supabase
-          .from("transactions")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-
-      if (findError) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not retrieve transaction.",
-        });
-      }
-
-      if (!transaction) {
-        return res.status(404).json({
-          success: false,
-          message: "Transaction not found.",
-        });
-      }
-
-      if (transaction.status === "completed") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "A completed transaction cannot be cancelled.",
-        });
-      }
-
-      const notes =
-        admin_notes
-          ? String(admin_notes).trim()
-          : "Transaction cancelled by admin.";
-
-      const { data, error } =
-        await supabase
-          .from("transactions")
-          .update({
-            status: "cancelled",
-            admin_notes: notes,
-            updated_at:
-              new Date().toISOString(),
-          })
-          .eq("id", id)
-          .select()
-          .single();
-
-      if (error) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Could not cancel transaction.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message: "Transaction cancelled.",
-        transaction: data,
-      });
-    } catch (error) {
-      console.error(
-        "Admin cancellation error:",
-        error.message
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Could not cancel transaction.",
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN — CLICKPESA CONNECTION TEST
-   ========================================================= */
-
-app.get(
-  "/api/admin/test-clickpesa-token",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const token = await getClickPesaToken();
-
-      return res.json({
-        ok: true,
-        clickpesaConnected: true,
-        tokenReceived: Boolean(token),
-      });
-    } catch (error) {
-      console.error(
-        "ClickPesa token test failed:",
-        error.response?.data ||
-          error.message
-      );
-
-      return res.status(500).json({
-        ok: false,
-        clickpesaConnected: false,
-        error:
-          error.response?.data ||
-          error.message,
-      });
-    }
-  }
-);
-
-/* =========================================================
-   GLOBAL ERROR HANDLER
-   ========================================================= */
-
-app.use(
-  (error, req, res, next) => {
-    console.error(
-      "Unhandled server error:",
-      error
-    );
-
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
-  }
-);
-
-/* =========================================================
-   START SERVER
-   ========================================================= */
-
-if (missingEnvironmentVariables.length > 0) {
-  console.error(
-    "Server will not start until the required environment variables are configured."
-  );
-  process.exit(1);
-}
-
-app.listen(PORT, () => {
-  console.log(
-    `SwiftFX server running on port ${PORT}`
-  );
-
-  console.log(
-    `ClickPesa API: ${CLICKPESA_BASE_URL}`
-  );
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`SwiftFX Backend running on port ${PORT}`);
 });
